@@ -69,7 +69,7 @@ desktop.ini
 
 # Project specific
 task_agent.db
-configuration.json
+credentials.json
 *.ipynb
 *.ipynb_checkpoints/
 

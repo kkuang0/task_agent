@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from src.utils.json_helpers import extract_json_block
 import traceback
 from src.agents.time_constraint_parser import TimeConstraintParser
+from src.utils.calendar import get_calendar_service, get_calendar_events
+from src.utils.logging import logger
 
 class ScheduledTask(BaseModel):
     task_id: str
@@ -24,6 +26,26 @@ class SchedulerAgent(BaseAgent):
         self.model = cp_model.CpModel()
         self.time_parser = TimeConstraintParser()
     
+    def _get_unavailable_times(self, start_time: datetime, end_time: datetime) -> List[Dict[str, datetime]]:
+        """Get list of unavailable time slots from Google Calendar"""
+        try:
+            service = get_calendar_service()
+            events = get_calendar_events(service, start_time.isoformat(), end_time.isoformat())
+            
+            unavailable_times = []
+            for event in events:
+                event_start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
+                event_end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
+                unavailable_times.append({
+                    'start': event_start,
+                    'end': event_end
+                })
+            return unavailable_times
+        except Exception as e:
+            logger.error(f"Error fetching calendar events: {str(e)}")
+            # Return empty list if calendar service is not available
+            return []
+
     def _format_prompt(self, input_data: Dict[str, Any]) -> str:
         tasks = input_data.get("tasks", [])
         estimates = input_data.get("estimates", [])
@@ -67,24 +89,19 @@ class SchedulerAgent(BaseAgent):
         task_deadlines = self.time_parser.extract_task_constraints(tasks)
         global_constraints = self.time_parser.extract_global_constraints(constraints)
         
-        # Print extracted time constraints for debugging
-        print(f"Task deadlines: {task_deadlines}")
-        print(f"Global constraints: {global_constraints}")
-        
-        # Debug: print all task IDs and estimate task_ids
-        print(f"Task IDs: {[task.get('id') for task in tasks]}")
-        print(f"Estimate task_ids: {[est.get('task_id') for est in estimates]}")
+        # Get unavailable times from Google Calendar
+        start_time = datetime.now()
+        end_time = start_time + timedelta(days=180)  # 6 months window
+        unavailable_times = self._get_unavailable_times(start_time, end_time)
         
         # Create a larger scheduling window to ensure feasibility
-        # Allow tasks to be scheduled within a 180-day window (6 months)
-        max_time = 180 * 24 * 60  
+        max_time = 180 * 24 * 60  # 180 days in minutes
 
         # Determine the project deadline if specified
         project_end_time = max_time
         if global_constraints['project_deadline']:
             project_end_minutes = int((global_constraints['project_deadline'] - datetime.now()).total_seconds() / 60)
             project_end_time = min(max_time, max(0, project_end_minutes))
-            print(f"Project deadline in minutes: {project_end_time}")
 
         task_vars = {}
         task_end_vars = {}
@@ -93,28 +110,20 @@ class SchedulerAgent(BaseAgent):
         # Step 1: Create variables for each task (start and end times)
         for task in tasks:
             task_id = str(task.get('id'))
-            # Try different ways to match estimates to tasks
             matching_estimate = next((e for e in estimates if str(e.get('task_id')) == task_id), None)
             
-            # If no match found, try with ID field names used in other places
             if matching_estimate is None:
-                # Try with ID capitalized (as in Subtask model)
                 alt_id = str(task.get('ID', task.get('id')))
                 matching_estimate = next((e for e in estimates if str(e.get('task_id')) == alt_id), None)
                 
                 if matching_estimate is None:
-                    # As a fallback, use a default duration
-                    print(f"WARNING: No estimate found for task_id: {task_id}, using default")
                     duration = 60  # Default 1 hour
                 else:
                     duration = int(matching_estimate['estimated_duration_minutes'])
             else:
                 duration = int(matching_estimate['estimated_duration_minutes'])
             
-            # Store the duration for later use
             task_durations[task_id] = duration
-            
-            # Create variables for start and end times
             task_vars[task_id] = model.NewIntVar(0, max_time, f'start_task_{task_id}')
             task_end_vars[task_id] = model.NewIntVar(0, max_time, f'end_task_{task_id}')
             
@@ -125,37 +134,41 @@ class SchedulerAgent(BaseAgent):
             if task_id in task_deadlines:
                 deadline_minutes = int((task_deadlines[task_id] - datetime.now()).total_seconds() / 60)
                 if deadline_minutes > 0:
-                    print(f"Adding deadline constraint for task {task_id}: {deadline_minutes} minutes")
-                    model.Add(task_end_vars[task_id] <= deadline_minutes)
+                    deadline_var = model.NewIntVar(0, max_time, f'deadline_{task_id}')
+                    model.Add(deadline_var == int(deadline_minutes))
+                    model.Add(task_end_vars[task_id] <= deadline_var)
 
         # Step 2: Add dependency constraints
         for task in tasks:
-            task_id = str(task.get('id'))
-            dependencies = task.get('dependencies', [])
-            
-            # Convert dependencies to strings if they aren't already
-            dependencies = [str(dep) for dep in dependencies]
+            task_id = str(task.get('id', ''))
+            dependencies = [str(dep) for dep in task.get('dependencies', [])]
             
             for dep_id in dependencies:
                 if dep_id in task_vars:
-                    # Ensure task starts after dependency ends
                     model.Add(task_vars[task_id] >= task_end_vars[dep_id])
         
-        # Step 3: Add constraints for work hours if specified
-        if global_constraints['work_hours']:
-            work_start = global_constraints['work_hours']['start']
-            work_end = global_constraints['work_hours']['end']
-            work_hours_per_day = work_end - work_start
+        # Step 3: Add constraints for unavailable times
+        for unavailable in unavailable_times:
+            unavailable_start = int((unavailable['start'] - datetime.now()).total_seconds() / 60)
+            unavailable_end = int((unavailable['end'] - datetime.now()).total_seconds() / 60)
             
-            # Disable this for now as it's complex to implement properly
-            # TODO: Implement work hours constraints
+            for task_id in task_vars:
+                # Add constraint that task must either end before unavailable time starts
+                # or start after unavailable time ends
+                before_unavailable = model.NewBoolVar(f'before_unavailable_{task_id}_{unavailable_start}')
+                model.Add(task_end_vars[task_id] <= unavailable_start).OnlyEnforceIf(before_unavailable)
+                model.Add(task_vars[task_id] >= unavailable_end).OnlyEnforceIf(before_unavailable.Not())
         
         # Step 4: Add project deadline constraint if specified
         if global_constraints['project_deadline']:
-            for task_id in task_end_vars:
-                model.Add(task_end_vars[task_id] <= project_end_time)
+            project_deadline_minutes = int((global_constraints['project_deadline'] - datetime.now()).total_seconds() / 60)
+            if project_deadline_minutes > 0:
+                project_deadline_var = model.NewIntVar(0, max_time, 'project_deadline')
+                model.Add(project_deadline_var == int(project_deadline_minutes))
+                for task_id in task_end_vars:
+                    model.Add(task_end_vars[task_id] <= project_deadline_var)
         
-        # Step 5: Add objective to minimize makespan (completion time of the last task)
+        # Step 5: Add objective to minimize makespan
         makespan = model.NewIntVar(0, max_time, 'makespan')
         for task_id in task_end_vars:
             model.Add(makespan >= task_end_vars[task_id])
@@ -164,14 +177,9 @@ class SchedulerAgent(BaseAgent):
 
         # Create the solver and solve
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 20.0  # Set a time limit to avoid hanging
+        solver.parameters.max_time_in_seconds = 20.0
         status = solver.Solve(model)
 
-        # Debug solver status
-        print(f"Solver status: {status}")
-        print(f"  OPTIMAL={cp_model.OPTIMAL}, FEASIBLE={cp_model.FEASIBLE}, INFEASIBLE={cp_model.INFEASIBLE}")
-        
-        # Return a schedule even if we only have a partial solution
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             scheduled_tasks = []
             for task in tasks:
@@ -179,10 +187,8 @@ class SchedulerAgent(BaseAgent):
                 start_time = datetime.now() + timedelta(minutes=solver.Value(task_vars[task_id]))
                 end_time = start_time + timedelta(minutes=task_durations[task_id])
                 
-                # Get the deadline if it exists (but don't set if None)
                 deadline = task_deadlines.get(task_id)
                 
-                # Create task object with deadline only if one exists
                 task_params = {
                     "task_id": task_id,
                     "start_time": start_time,
@@ -190,25 +196,20 @@ class SchedulerAgent(BaseAgent):
                     "assigned_to": "default"
                 }
                 
-                # Only add deadline if it exists
                 if deadline is not None:
                     task_params["deadline"] = deadline
                     
                 scheduled_tasks.append(ScheduledTask(**task_params))
             return scheduled_tasks
         else:
-            # If no feasible solution found, create a simple sequential schedule as fallback
+            # Fallback to sequential scheduling if no feasible solution found
             print("No feasible schedule found. Creating sequential schedule as fallback.")
             current_time = datetime.now()
             scheduled_tasks = []
-
-            # Sort tasks by dependencies to ensure we schedule parents first
-            # This is a simple topological sort
             task_ids_to_schedule = set(task.get('id') for task in tasks)
             scheduled_task_ids = set()
 
             while task_ids_to_schedule:
-                # Find tasks with no unscheduled dependencies
                 for task in tasks:
                     task_id = str(task.get('id'))
                     if task_id not in task_ids_to_schedule:
@@ -218,11 +219,16 @@ class SchedulerAgent(BaseAgent):
                     unscheduled_dependencies = dependencies - scheduled_task_ids
                     
                     if not unscheduled_dependencies:
-                        # Schedule this task
-                        duration = task_durations.get(task_id, 60)  # Default to 60 if not found
+                        duration = task_durations.get(task_id, 60)
+                        
+                        # Check if current time is in an unavailable slot
+                        for unavailable in unavailable_times:
+                            if unavailable['start'] <= current_time < unavailable['end']:
+                                current_time = unavailable['end']
+                                break
+                        
                         end_time = current_time + timedelta(minutes=duration)
                         
-                        # Create task object with required fields
                         task_params = {
                             "task_id": task_id,
                             "start_time": current_time,
@@ -230,27 +236,30 @@ class SchedulerAgent(BaseAgent):
                             "assigned_to": "default"
                         }
                         
-                        # Only add deadline if it exists
                         deadline = task_deadlines.get(task_id)
                         if deadline is not None:
                             task_params["deadline"] = deadline
                             
                         scheduled_tasks.append(ScheduledTask(**task_params))
                         
-                        # Update tracking variables
                         scheduled_task_ids.add(task_id)
                         task_ids_to_schedule.remove(task_id)
                         current_time = end_time
                         break
                 else:
-                    # If we've gone through all tasks with no progress, there must be a circular dependency
-                    # Pick the first unscheduled task and force it
+                    # Handle potential circular dependencies
                     print("WARNING: Potential circular dependency detected!")
                     task_id = next(iter(task_ids_to_schedule))
                     duration = task_durations.get(task_id, 60)
+                    
+                    # Check if current time is in an unavailable slot
+                    for unavailable in unavailable_times:
+                        if unavailable['start'] <= current_time < unavailable['end']:
+                            current_time = unavailable['end']
+                            break
+                    
                     end_time = current_time + timedelta(minutes=duration)
                     
-                    # Create task object with required fields
                     task_params = {
                         "task_id": task_id,
                         "start_time": current_time,
@@ -258,7 +267,6 @@ class SchedulerAgent(BaseAgent):
                         "assigned_to": "default"
                     }
                     
-                    # Only add deadline if it exists
                     deadline = task_deadlines.get(task_id)
                     if deadline is not None:
                         task_params["deadline"] = deadline
