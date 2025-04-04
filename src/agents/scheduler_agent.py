@@ -107,9 +107,9 @@ class SchedulerAgent(BaseAgent):
                     print(f"WARNING: No estimate found for task_id: {task_id}, using default")
                     duration = 60  # Default 1 hour
                 else:
-                    duration = matching_estimate['estimated_duration_minutes']
+                    duration = int(matching_estimate['estimated_duration_minutes'])
             else:
-                duration = matching_estimate['estimated_duration_minutes']
+                duration = int(matching_estimate['estimated_duration_minutes'])
             
             # Store the duration for later use
             task_durations[task_id] = duration
