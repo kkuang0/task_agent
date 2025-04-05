@@ -4,7 +4,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import os
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from src.utils.logging import logger
 
@@ -19,12 +19,33 @@ def get_calendar_service():
         creds = None
         credentials_path = os.getenv('GOOGLE_CALENDAR_CREDENTIALS')
         
+        logger.debug(f"Looking for credentials file at: {credentials_path}")
+        logger.debug(f"Current working directory: {os.getcwd()}")
+        
         if not credentials_path:
             logger.warning("GOOGLE_CALENDAR_CREDENTIALS environment variable not set")
+            logger.info("Please set GOOGLE_CALENDAR_CREDENTIALS in your .env file to point to your credentials.json file")
             return None
             
-        if not os.path.exists(credentials_path):
-            logger.warning(f"Credentials file not found at {credentials_path}")
+        # Try multiple possible locations for the credentials file
+        possible_paths = [
+            credentials_path,  # Original path
+            os.path.join(os.getcwd(), credentials_path),  # Relative to current directory
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), credentials_path),  # Relative to this file
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), credentials_path)  # Relative to src directory
+        ]
+        
+        for path in possible_paths:
+            logger.debug(f"Trying path: {path}")
+            if os.path.exists(path):
+                credentials_path = path
+                logger.debug(f"Found credentials file at: {credentials_path}")
+                break
+        else:
+            logger.warning(f"Credentials file not found at any of these locations: {possible_paths}")
+            logger.info("Please make sure your credentials.json file is in one of these locations:")
+            for path in possible_paths:
+                logger.info(f"- {path}")
             return None
         
         # The file token.pickle stores the user's access and refresh tokens
@@ -120,9 +141,9 @@ def get_calendar_events(service, time_min=None, time_max=None):
         
     try:
         if time_min is None:
-            time_min = datetime.utcnow().isoformat() + 'Z'
+            time_min = datetime.now(timezone.utc).isoformat() + 'Z'
         if time_max is None:
-            time_max = (datetime.utcnow() + timedelta(days=7)).isoformat() + 'Z'
+            time_max = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat() + 'Z'
         
         events_result = service.events().list(
             calendarId='primary',

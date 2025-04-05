@@ -14,4 +14,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         logger.error(f"Application error: {str(e)}")
-        exit(1) 
+        exit(1)

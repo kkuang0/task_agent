@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+from src.utils.logging import logger
 
 load_dotenv()
 
@@ -56,6 +57,9 @@ def validate_settings():
     
     if not settings.GOOGLE_CALENDAR_CREDENTIALS:
         missing_settings.append("GOOGLE_CALENDAR_CREDENTIALS")
+        logger.debug(f"Environment variables: {dict(os.environ)}")
+        logger.debug(f"Current working directory: {os.getcwd()}")
+        logger.debug(f"Files in directory: {os.listdir('.')}")
     
     if missing_settings:
         raise ValueError(

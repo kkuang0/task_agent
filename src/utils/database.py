@@ -113,3 +113,42 @@ def update_task(db, task_id, update_data):
         db.commit()
         db.refresh(task)
     return task
+
+def add_note(db, note_data):
+    """Add a new note to the database"""
+    from src.models.task import Note
+    note = Note(**note_data)
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return note
+
+def get_note(db, note_id):
+    """Get a note by ID"""
+    from src.models.task import Note
+    return db.query(Note).filter(Note.id == note_id).first()
+
+def get_task_notes(db, task_id):
+    """Get all notes for a task"""
+    from src.models.task import Note
+    return db.query(Note).filter(Note.task_id == task_id).all()
+
+def update_note(db, note_id, update_data):
+    """Update a note"""
+    from src.models.task import Note
+    note = db.query(Note).filter(Note.id == note_id).first()
+    if note:
+        for key, value in update_data.items():
+            setattr(note, key, value)
+        db.commit()
+        db.refresh(note)
+    return note
+
+def delete_note(db, note_id):
+    """Delete a note"""
+    from src.models.task import Note
+    note = db.query(Note).filter(Note.id == note_id).first()
+    if note:
+        db.delete(note)
+        db.commit()
+    return True

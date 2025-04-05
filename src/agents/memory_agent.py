@@ -14,6 +14,7 @@ class TaskFeedback(BaseModel):
     accuracy_feedback: float  # 0-1 scale
     priority_feedback: float  # 0-1 scale
     notes: str
+    created_at: datetime = None
 
 class MemoryAgent(BaseAgent):
     def __init__(self):
@@ -66,11 +67,20 @@ class MemoryAgent(BaseAgent):
     
     def _store_feedback(self, feedback: TaskFeedback):
         # Store feedback in ChromaDB
+        feedback_data = {
+            "task_id": feedback.task_id,
+            "actual_duration_minutes": feedback.actual_duration_minutes,
+            "accuracy_feedback": feedback.accuracy_feedback,
+            "priority_feedback": feedback.priority_feedback,
+            "notes": feedback.notes,
+            "created_at": feedback.created_at.isoformat() if feedback.created_at else None
+        }
+        
         self.collection.add(
-            documents=[json.dumps(feedback.model_dump())],
+            documents=[json.dumps(feedback_data)],
             metadatas=[{
                 "task_id": feedback.task_id,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": feedback.created_at.isoformat() if feedback.created_at else datetime.now().isoformat(),
                 "accuracy": feedback.accuracy_feedback,
                 "priority": feedback.priority_feedback
             }],

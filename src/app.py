@@ -2,6 +2,7 @@ import streamlit as st
 import asyncio
 import nest_asyncio
 import logging
+import hashlib
 from src import initialize_app
 from src.agents.planner_agent import PlannerAgent
 from src.agents.estimator_agent import EstimatorAgent
@@ -13,105 +14,70 @@ import plotly.express as px
 import time
 import uuid
 from src.utils.database import init_db
+from src.utils.logging import logger
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Define the notes interface
+def run_notes_interface():
+    st.subheader("Create a New Note")
+    
+    # Using unique keys by adding a unique identifier
+    note_title = st.text_input("Title", key="notes_title_input")
+    note_content = st.text_area("Content", height=200, key="notes_content_input")
+    note_tags = st.text_input("Tags (comma-separated)", key="notes_tags_input")
+    
+    # Initialize projects if not exists
+    if 'projects' not in st.session_state:
+        st.session_state.projects = {}
+        
+    # Initialize notes if not exists
+    if 'notes' not in st.session_state:
+        st.session_state.notes = {}
+        
+    project_options = ["None"] + list(st.session_state.projects.keys())
+    assigned_project = st.selectbox("Assign to Project", options=project_options, key="notes_project_select")
 
-# Initialize the application first
-if not initialize_app():
-    logger.error("Failed to initialize application. Exiting...")
-    st.error("Failed to initialize application")
-    st.stop()
-else:
-    logger.info("Application initialized successfully")
+    if st.button("Save Note", key="notes_save_button"):
+        if note_title and note_content:
+            note_data = {
+                "task_id": None if assigned_project == "None" else assigned_project,
+                "title": note_title,
+                "content": note_content,
+                "tags": [t.strip() for t in note_tags.split(",") if t.strip()]
+            }
+            # Store note in session state
+            note_id = str(uuid.uuid4())
+            st.session_state.notes[note_id] = note_data
+            st.success("Note added successfully")
 
-# Initialize database
-try:
-    init_db()
-    logger.info("Database initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize database: {str(e)}")
-    st.error(f"Failed to initialize database: {str(e)}")
-    st.stop()
+            # Reset form
+            st.experimental_rerun()
+        else:
+            st.error("Title and content are required.")
 
-# Patch the event loop for Streamlit
-try:
-    nest_asyncio.apply()
-    logger.info("Successfully patched event loop with nest_asyncio")
-except Exception as e:
-    logger.error(f"Failed to patch event loop: {str(e)}")
-    st.error(f"Failed to initialize application: {str(e)}")
-    st.stop()
+    # Note Listing
+    st.subheader("View Notes")
+    filter_option = st.selectbox("Filter Notes", options=["All", "Project-specific", "Unassigned"], key="notes_filter_select")
 
-# Initialize agents
-try:
-    planner = PlannerAgent()
-    estimator = EstimatorAgent()
-    scheduler = SchedulerAgent()
-    memory = MemoryAgent()
-    logger.info("Successfully initialized all agents")
-except Exception as e:
-    logger.error(f"Failed to initialize agents: {str(e)}")
-    st.error(f"Failed to initialize application: {str(e)}")
-    st.stop()
+    # Filter notes based on selection
+    filtered_notes = {}
+    for note_id, note in st.session_state.notes.items():
+        if filter_option == "All":
+            filtered_notes[note_id] = note
+        elif filter_option == "Project-specific" and note["task_id"] is not None:
+            filtered_notes[note_id] = note
+        elif filter_option == "Unassigned" and note["task_id"] is None:
+            filtered_notes[note_id] = note
 
-async def process_task(project_description: str, constraints: list):
-    try:
-        # Step 1: Planning
-        planning_input = {
-            "project_description": project_description,
-            "constraints": constraints
-        }
-        planning_result = await planner.process(planning_input)
+    # Display filtered notes
+    for note_id, note in filtered_notes.items():
+        with st.expander(f"{note['title']} (Task ID: {note['task_id']})", key=f"note_expander_{note_id}"):
+            st.markdown(note['content'])
+            st.write("Tags:", ", ".join(note['tags']) if note['tags'] else "None")
 
-        if not planning_result.success:
-            logger.error(f"Planning failed: {planning_result.error}")
-            return {"error": planning_result.error}
-
-        subtasks = planning_result.data["subtasks"]
-        logger.info(f"Successfully generated {len(subtasks)} subtasks")
-
-        # Step 2: Estimation
-        estimation_input = {
-            "tasks": [s.model_dump() for s in subtasks],
-            "historical_data": {}
-        }
-        estimation_result = await estimator.process(estimation_input)
-
-        if not estimation_result.success:
-            logger.error(f"Estimation failed: {estimation_result.error}")
-            return {"error": estimation_result.error}
-
-        estimates = estimation_result.data["estimates"]
-        logger.info(f"Successfully generated {len(estimates)} estimates")
-
-        # Step 3: Scheduling
-        scheduling_input = {
-            "tasks": [task.model_dump() for task in subtasks],
-            "estimates": [estimate.model_dump() for estimate in estimates],
-            "constraints": constraints
-        }
-        scheduling_result = await scheduler.process(scheduling_input)
-
-        if not scheduling_result.success:
-            logger.error(f"Scheduling failed: {scheduling_result.error}")
-            return {"error": scheduling_result.error}
-
-        logger.info("Successfully generated schedule")
-        return {
-            "subtasks": subtasks,
-            "estimates": estimates,
-            "schedule": scheduling_result.data
-        }
-
-    except Exception as e:
-        logger.error(f"Unexpected error in process_task: {str(e)}")
-        return {"error": f"Unexpected error: {str(e)}"}
-
-def main():
-    st.title("Autonomous Task Agent System")
-
+# Define the projects interface
+def run_projects_interface():
+    st.header("Project Management")
+    
     # Initialize session state for storing results and projects
     if 'last_result' not in st.session_state:
         st.session_state.last_result = None
@@ -123,7 +89,7 @@ def main():
         st.session_state.current_project_id = None
 
     # Project Selection
-    st.header("Project Management")
+    st.subheader("Project Selection")
     
     # Create two columns for project selection and new project
     col1, col2 = st.columns([3, 1])
@@ -134,7 +100,8 @@ def main():
                              for pid, data in st.session_state.projects.items()}
             selected_project = st.selectbox(
                 "Select Existing Project",
-                options=["New Project"] + list(project_options.keys())
+                options=["New Project"] + list(project_options.keys()),
+                key="project_select"
             )
             
             if selected_project != "New Project":
@@ -155,7 +122,7 @@ def main():
                     st.success("Project loaded successfully!")
     
     with col2:
-        if st.button("Clear Project"):
+        if st.button("Clear Project", key="clear_project_button"):
             st.session_state.current_project_id = None
             st.session_state.last_result = None
             st.session_state.show_results = False
@@ -163,10 +130,10 @@ def main():
 
     # Project Input
     st.header("Project Details")
-    project_description = st.text_area("Project Description")
-    constraints = st.text_area("Constraints (one per line)").split("\n")
+    project_description = st.text_area("Project Description", key="project_description_input")
+    constraints = st.text_area("Constraints (one per line)", key="project_constraints_input").split("\n")
 
-    if st.button("Process Project"):
+    if st.button("Process Project", key="process_project_button"):
         if not project_description:
             st.error("Please enter a project description")
             return
@@ -179,6 +146,11 @@ def main():
         status_message = st.empty()
         
         try:
+            # Initialize agents
+            planner = PlannerAgent()
+            estimator = EstimatorAgent()
+            scheduler = SchedulerAgent()
+            
             # Phase 1: Planning
             status_message.info("Phase 1/3: Planning tasks...")
             progress_bar.progress(10)
@@ -277,7 +249,7 @@ def main():
         
         # Add a save button for the current project
         if st.session_state.current_project_id:
-            if st.button("Save Project"):
+            if st.button("Save Project", key="save_project_button"):
                 st.success("Project saved successfully!")
         
         subtasks = st.session_state.last_result["subtasks"]
@@ -286,39 +258,9 @@ def main():
 
         # Subtasks
         st.subheader("Subtasks")
-        
-        # Create a mapping of task IDs to their objects for quick lookup
-        task_map = {str(task.id): task for task in subtasks}
-        
-        # Create a mapping of task IDs to their children
-        children_map = {}
-        for task in subtasks:
-            for dep_id in task.dependencies:
-                dep_id_str = str(dep_id)
-                if dep_id_str not in children_map:
-                    children_map[dep_id_str] = []
-                children_map[dep_id_str].append(task)
-        
-        # Find root tasks (tasks with no dependencies)
-        root_tasks = [task for task in subtasks if not task.dependencies]
-        
-        # Initialize a counter for unique task instances
-        task_counter = {}
-        
-        def get_unique_key(task_id, parent_id, level):
-            # Initialize counter for this task if not exists
-            key = f"{task_id}_{parent_id}_{level}"
-            if key not in task_counter:
-                task_counter[key] = 0
-            task_counter[key] += 1
-            return f"{key}_{task_counter[key]}"
-        
-        def render_task_with_dependencies(task, level=0, parent_id=None):
-            # Generate unique key for this task instance
-            unique_key = get_unique_key(str(task.id), parent_id if parent_id else 'root', level)
-            
+        for idx, task in enumerate(subtasks):
             # Initialize task completion state if not exists
-            task_key = f"task_completed_{unique_key}"
+            task_key = f"task_completed_{task.id}_{idx}"
             if task_key not in st.session_state:
                 st.session_state[task_key] = False
             
@@ -326,35 +268,21 @@ def main():
             col1, col2 = st.columns([1, 20])
             
             with col1:
-                # Checkbox for task completion with unique key
+                # Checkbox for task completion
                 is_completed = st.checkbox(
                     "✓",
                     value=st.session_state[task_key],
-                    key=f"checkbox_{unique_key}",
+                    key=f"checkbox_{task.id}_{idx}",
                     help="Mark task as completed"
                 )
                 st.session_state[task_key] = is_completed
             
             with col2:
-                # Add indentation based on level
-                indent = "&nbsp;" * (level * 4)  # 4 spaces per level
-                expander_title = f"{indent}{'└─ ' if level > 0 else ''}**{task.title}** {'✅' if is_completed else ''}"
-                
-                with st.expander(expander_title):
+                # Task expander with completion status
+                expander_title = f"**{task.title}** {'✅' if is_completed else ''}"
+                with st.expander(expander_title, key=f"task_expander_{task.id}_{idx}"):
                     st.write(f"Description: {task.description}")
-                    
-                    # Display dependencies in a more structured way
-                    if task.dependencies:
-                        st.write("**Depends on:**")
-                        for dep_id in task.dependencies:
-                            dep_task = task_map.get(str(dep_id))
-                            if dep_task:
-                                dep_key = get_unique_key(str(dep_id), str(task.id), level)
-                                dep_status = "✅" if st.session_state.get(f"task_completed_{dep_key}", False) else "⏳"
-                                st.write(f"- {dep_task.title} {dep_status}")
-                            else:
-                                st.write(f"- Task {dep_id} (not found)")
-                    
+                    st.write(f"Dependencies: {', '.join(map(str, task.dependencies))}")
                     st.write(f"Priority: {task.priority}/5")
                     
                     # Find the estimate for this task
@@ -368,38 +296,38 @@ def main():
                         st.write("---")
                         st.subheader("Task Feedback")
                         
-                        # Feedback inputs with unique keys
+                        # Feedback inputs
                         actual_duration = st.number_input(
                             "Actual Duration (minutes)", 
                             min_value=0, 
                             max_value=1440, 
                             value=task_estimate.estimated_duration_minutes if task_estimate else 60,
-                            key=f"duration_{unique_key}"
+                            key=f"duration_input_{task.id}_{idx}"
                         )
                         
                         # Calculate default values
                         original_estimate = task_estimate.estimated_duration_minutes if task_estimate else 0
                         accuracy_default = min(1.0, max(0.0, 1.0 - abs(original_estimate - actual_duration) / max(original_estimate, 1)))
                         
-                        # Feedback metrics with unique keys
+                        # Feedback metrics
                         accuracy = st.slider(
                             "Accuracy Feedback (0-1)", 
                             0.0, 1.0, 
                             accuracy_default,
-                            key=f"accuracy_{unique_key}"
+                            key=f"accuracy_slider_{task.id}_{idx}"
                         )
                         priority = st.slider(
                             "Priority Feedback (0-1)", 
                             0.0, 1.0, 
                             0.5,
-                            key=f"priority_{unique_key}"
+                            key=f"priority_slider_{task.id}_{idx}"
                         )
                         notes = st.text_area(
                             "Notes",
-                            key=f"notes_{unique_key}"
+                            key=f"notes_input_{task.id}_{idx}"
                         )
                         
-                        if st.button("Submit Feedback", key=f"submit_{unique_key}"):
+                        if st.button("Submit Feedback", key=f"submit_feedback_{task.id}_{idx}"):
                             # Ensure task_id is a string
                             task_id_str = str(task.id)
                             feedback_input = {
@@ -416,6 +344,7 @@ def main():
                             
                             with st.spinner("Processing feedback..."):
                                 try:
+                                    memory = MemoryAgent()
                                     result = asyncio.get_event_loop().run_until_complete(memory.process(feedback_input))
                                     
                                     if result.success:
@@ -472,16 +401,6 @@ def main():
                                     st.error(f"An error occurred while processing feedback: {str(e)}")
                     else:
                         st.info("Complete the task to provide feedback.")
-            
-            # Recursively render child tasks
-            task_id_str = str(task.id)
-            if task_id_str in children_map:
-                for child_task in children_map[task_id_str]:
-                    render_task_with_dependencies(child_task, level + 1, task_id_str)
-        
-        # Render all root tasks and their children
-        for root_task in root_tasks:
-            render_task_with_dependencies(root_task)
 
         # Schedule
         st.subheader("Optimized Schedule")
@@ -520,95 +439,99 @@ def main():
                 schedule_data.append(schedule_item)
             
             schedule_df = pd.DataFrame(schedule_data)
+            st.dataframe(schedule_df, key="schedule_dataframe")
             
-            # Create tabs for different views
-            tab1, tab2 = st.tabs(["Calendar View", "Table View"])
+            # Generate a Gantt chart visualization
+            fig = px.timeline(
+                schedule_data, 
+                x_start="Start Time", 
+                x_end="End Time", 
+                y="Task",
+                color="Status" if any("Status" in item for item in schedule_data) else "Task",
+                title="Task Schedule Gantt Chart"
+            )
             
-            with tab1:
-                # Calendar View
-                st.subheader("Monthly Calendar")
-                
-                # Get the month to display (default to current month)
-                today = datetime.now()
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    selected_month = st.date_input(
-                        "Select Month",
-                        value=today,
-                        format="YYYY-MM-DD"
-                    )
-                
-                # Create a calendar for the selected month
-                calendar_data = []
-                for task in schedule["optimized_schedule"]:
-                    start_time = datetime.fromisoformat(task["start_time"])
-                    if start_time.year == selected_month.year and start_time.month == selected_month.month:
-                        task_id = task["task_id"]
-                        task_obj = next((t for t in subtasks if str(t.id) == str(task_id)), None)
-                        if task_obj:
-                            calendar_data.append({
-                                "date": start_time.date(),
-                                "task": task_obj.title,
-                                "start_time": start_time.strftime("%H:%M"),
-                                "end_time": datetime.fromisoformat(task["end_time"]).strftime("%H:%M"),
-                                "priority": task_obj.priority
-                            })
-                
-                # Create a calendar grid
-                st.write("### Tasks for", selected_month.strftime("%B %Y"))
-                
-                # Group tasks by date
-                tasks_by_date = {}
-                for item in calendar_data:
-                    date_str = item["date"].strftime("%Y-%m-%d")
-                    if date_str not in tasks_by_date:
-                        tasks_by_date[date_str] = []
-                    tasks_by_date[date_str].append(item)
-                
-                # Display calendar
-                for date_str, tasks in sorted(tasks_by_date.items()):
-                    date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    st.write(f"#### {date.strftime('%A, %B %d')}")
-                    for task in tasks:
-                        with st.expander(f"{task['start_time']} - {task['end_time']}: {task['task']}"):
-                            st.write(f"**Priority**: {task['priority']}/5")
-                            st.write(f"**Time**: {task['start_time']} - {task['end_time']}")
+            # Add deadline markers if available
+            if any("Deadline" in item for item in schedule_data):
+                for task in schedule_data:
+                    if "Deadline" in task:
+                        fig.add_vline(
+                            x=task["Deadline"], 
+                            line_dash="dash", 
+                            line_color="red",
+                            annotation_text=f"Deadline: {task['Task']}"
+                        )
             
-            with tab2:
-                # Table View
-                st.dataframe(schedule_df)
-                
-                # Add Google Calendar sync button
-                if st.button("Sync to Google Calendar"):
-                    try:
-                        from src.utils.calendar import get_calendar_service, create_calendar_event
-                        
-                        # Get calendar service
-                        service = get_calendar_service()
-                        
-                        # Create events for each task
-                        for task in schedule["optimized_schedule"]:
-                            task_id = task["task_id"]
-                            task_obj = next((t for t in subtasks if str(t.id) == str(task_id)), None)
-                            if task_obj:
-                                start_time = datetime.fromisoformat(task["start_time"])
-                                end_time = datetime.fromisoformat(task["end_time"])
-                                
-                                # Create calendar event
-                                event = create_calendar_event(
-                                    service,
-                                    task_obj,
-                                    start_time,
-                                    end_time
-                                )
-                        
-                        st.success("Tasks successfully synced to Google Calendar!")
-                    except Exception as e:
-                        logger.error(f"Error syncing to Google Calendar: {str(e)}")
-                        st.error(f"Failed to sync to Google Calendar: {str(e)}")
-                        st.info("Please make sure you have set up your Google Calendar credentials in the .env file.")
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig, key="gantt_chart")
         else:
             st.write("No schedule data available")
 
+# Main application entry point
+def main():
+    # Set page configuration
+    st.set_page_config(page_title="Autonomous Task Agent System", layout="wide")
+
+    # Main title
+    st.title("📝 NoteDesk: Your Smart Productivity Workspace")
+
+    # Sidebar for mode selection
+    app_mode = st.sidebar.radio("Select Mode", ["🗒️ Notes", "📁 Projects"], key="mode_select")
+
+    # Ensure projects are initialized in session state
+    if 'projects' not in st.session_state:
+        st.session_state.projects = {}
+
+    # Ensure notes are initialized in session state
+    if 'notes' not in st.session_state:
+        st.session_state.notes = {}
+
+    # Run the appropriate interface based on selection
+    if app_mode == "🗒️ Notes":
+        run_notes_interface()
+    elif app_mode == "📁 Projects":
+        run_projects_interface()
+
+
 if __name__ == "__main__":
+    # Initialize the application
+    if not initialize_app():
+        logger.error("Failed to initialize application. Exiting...")
+        st.error("Failed to initialize application")
+        st.stop()
+    else:
+        logger.info("Application initialized successfully")
+
+    # Initialize database
+    try:
+        init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {str(e)}")
+        st.error(f"Failed to initialize database: {str(e)}")
+        st.stop()
+
+    # Patch the event loop for Streamlit
+    try:
+        nest_asyncio.apply()
+        logger.info("Successfully patched event loop with nest_asyncio")
+    except Exception as e:
+        logger.error(f"Failed to patch event loop: {str(e)}")
+        st.error(f"Failed to initialize application: {str(e)}")
+        st.stop()
+
+    # Initialize agents
+    try:
+        # Initialize agents globally to check they work
+        PlannerAgent()
+        EstimatorAgent()
+        SchedulerAgent()
+        MemoryAgent()
+        logger.info("Successfully initialized all agents")
+    except Exception as e:
+        logger.error(f"Failed to initialize agents: {str(e)}")
+        st.error(f"Failed to initialize application: {str(e)}")
+        st.stop()
+
+    # Run the application
     main()

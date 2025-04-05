@@ -19,6 +19,7 @@ class Task(Base):
     # Relationships
     estimates = relationship("TaskEstimate", back_populates="task")
     feedback = relationship("TaskFeedback", back_populates="task")
+    notes = relationship("Note", back_populates="task")
 
 class TaskEstimate(Base):
     __tablename__ = "task_estimates"
@@ -46,4 +47,18 @@ class TaskFeedback(Base):
     created_at = Column(DateTime, default=datetime.now(timezone.utc))
     
     # Relationships
-    task = relationship("Task", back_populates="feedback") 
+    task = relationship("Task", back_populates="feedback")
+
+class Note(Base):
+    __tablename__ = "notes"
+    
+    id = Column(Integer, primary_key=True)
+    task_id = Column(String, ForeignKey("tasks.id"))
+    title = Column(String, nullable=False)
+    content = Column(String, nullable=False)
+    tags = Column(JSON)  # List of tag strings
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
+    
+    # Relationships
+    task = relationship("Task", back_populates="notes") 

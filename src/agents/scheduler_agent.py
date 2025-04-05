@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from .base_agent import BaseAgent, AgentResponse
 from pydantic import BaseModel
 from ortools.sat.python import cp_model
@@ -21,29 +21,27 @@ class SchedulerAgent(BaseAgent):
     def __init__(self):
         super().__init__(
             name="Scheduler Agent",
-            description="You are a task scheduling agent that optimizes task assignments based on dependencies, durations, and constraints."
+            description="You are a task scheduling agent that creates optimized schedules while respecting dependencies and constraints."
         )
         self.model = cp_model.CpModel()
         self.time_parser = TimeConstraintParser()
+        self.calendar_service = get_calendar_service()
     
-    def _get_unavailable_times(self, start_time: datetime, end_time: datetime) -> List[Dict[str, datetime]]:
-        """Get list of unavailable time slots from Google Calendar"""
-        try:
-            service = get_calendar_service()
-            events = get_calendar_events(service, start_time.isoformat(), end_time.isoformat())
+    def _get_unavailable_times(self, start_time: datetime, end_time: datetime) -> List[Tuple[datetime, datetime]]:
+        """Get unavailable time slots from Google Calendar"""
+        if not self.calendar_service:
+            return []
             
+        try:
+            events = get_calendar_events(self.calendar_service, start_time, end_time)
             unavailable_times = []
             for event in events:
                 event_start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
                 event_end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
-                unavailable_times.append({
-                    'start': event_start,
-                    'end': event_end
-                })
+                unavailable_times.append((event_start, event_end))
             return unavailable_times
         except Exception as e:
-            logger.error(f"Error fetching calendar events: {str(e)}")
-            # Return empty list if calendar service is not available
+            logger.error(f"Error getting calendar events: {str(e)}")
             return []
 
     def _format_prompt(self, input_data: Dict[str, Any]) -> str:
@@ -149,8 +147,8 @@ class SchedulerAgent(BaseAgent):
         
         # Step 3: Add constraints for unavailable times
         for unavailable in unavailable_times:
-            unavailable_start = int((unavailable['start'] - datetime.now()).total_seconds() / 60)
-            unavailable_end = int((unavailable['end'] - datetime.now()).total_seconds() / 60)
+            unavailable_start = int((unavailable[0] - datetime.now()).total_seconds() / 60)
+            unavailable_end = int((unavailable[1] - datetime.now()).total_seconds() / 60)
             
             for task_id in task_vars:
                 # Add constraint that task must either end before unavailable time starts
@@ -223,8 +221,8 @@ class SchedulerAgent(BaseAgent):
                         
                         # Check if current time is in an unavailable slot
                         for unavailable in unavailable_times:
-                            if unavailable['start'] <= current_time < unavailable['end']:
-                                current_time = unavailable['end']
+                            if unavailable[0] <= current_time < unavailable[1]:
+                                current_time = unavailable[1]
                                 break
                         
                         end_time = current_time + timedelta(minutes=duration)
@@ -254,8 +252,8 @@ class SchedulerAgent(BaseAgent):
                     
                     # Check if current time is in an unavailable slot
                     for unavailable in unavailable_times:
-                        if unavailable['start'] <= current_time < unavailable['end']:
-                            current_time = unavailable['end']
+                        if unavailable[0] <= current_time < unavailable[1]:
+                            current_time = unavailable[1]
                             break
                     
                     end_time = current_time + timedelta(minutes=duration)
@@ -279,6 +277,74 @@ class SchedulerAgent(BaseAgent):
                     
             return scheduled_tasks
             
+    def update_schedule(self, current_schedule: List[Dict], completed_task_id: str, actual_duration: int) -> List[Dict]:
+        """
+        Update the schedule based on a completed task's actual duration.
+        
+        Args:
+            current_schedule: List of scheduled tasks
+            completed_task_id: ID of the completed task
+            actual_duration: Actual duration in minutes
+            
+        Returns:
+            Updated schedule with tasks adjusted based on the completion
+        """
+        try:
+            # Find the completed task in the schedule
+            completed_task = None
+            completed_index = -1
+            for i, task in enumerate(current_schedule):
+                if str(task["task_id"]) == str(completed_task_id):
+                    completed_task = task
+                    completed_index = i
+                    break
+            
+            if not completed_task:
+                logger.warning(f"Task {completed_task_id} not found in schedule")
+                return current_schedule
+            
+            # Calculate the time difference
+            scheduled_duration = int((datetime.fromisoformat(completed_task["end_time"]) - 
+                                    datetime.fromisoformat(completed_task["start_time"])).total_seconds() / 60)
+            time_diff = actual_duration - scheduled_duration
+            
+            if time_diff == 0:
+                # No change needed
+                return current_schedule
+            
+            # Update the schedule for tasks after the completed task
+            updated_schedule = current_schedule.copy()
+            for i in range(completed_index + 1, len(updated_schedule)):
+                task = updated_schedule[i]
+                current_start = datetime.fromisoformat(task["start_time"])
+                current_end = datetime.fromisoformat(task["end_time"])
+                
+                # Adjust times by the difference
+                new_start = current_start + timedelta(minutes=time_diff)
+                new_end = current_end + timedelta(minutes=time_diff)
+                
+                # Update the task times
+                task["start_time"] = new_start.isoformat()
+                task["end_time"] = new_end.isoformat()
+                
+                # Check if the task has a deadline
+                if "deadline" in task:
+                    deadline = datetime.fromisoformat(task["deadline"])
+                    if new_end > deadline:
+                        task["Status"] = "⚠️ Tight deadline"
+                    else:
+                        buffer = (deadline - new_end).total_seconds() / 3600
+                        if buffer < 24:
+                            task["Status"] = "⚠️ Tight deadline"
+                        else:
+                            task["Status"] = "✅ On track"
+            
+            return updated_schedule
+            
+        except Exception as e:
+            logger.error(f"Error updating schedule: {str(e)}")
+            return current_schedule
+
     async def process(self, input_data: Dict[str, Any]) -> AgentResponse:
         try:
             prompt = self._format_prompt(input_data)
